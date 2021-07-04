@@ -7,6 +7,8 @@ use std::path::Path;
 use std::fs;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use parasailors::*;
+
 // Will use traits later
 pub struct InputSequence<'a> {
     read_cl_id: usize,
@@ -137,7 +139,7 @@ pub fn cluster(sorted_data: &Vec<&InputSequence>) {
 
         if best_cluster_id_m.is_none() && nr_shared_kmers_m >= args_min_shared {
             // aln_called += 1
-            let (best_cluster_id_a, nr_shared_kmers_a, error_rate_sum, s1_alignment, s2_alignment, alignment_ratio) = get_best_cluster_block_align(read_cl_id, representatives, hit_clusters_ids, hit_clusters_hit_positions);
+            let (best_cluster_id_a, nr_shared_kmers_a, error_rate_sum, s1_alignment, s2_alignment, alignment_ratio) = get_best_cluster_block_align(sequence.read_cl_id, &representatives, &hit_clusters_ids, &hit_clusters_hit_positions);
             if best_cluster_id_a >= 0 {
               //  aln_passed_criteria += 1
             } else {
@@ -151,6 +153,65 @@ pub fn cluster(sorted_data: &Vec<&InputSequence>) {
 
 
     }
+
+}
+
+fn get_best_cluster_block_align(read_cl_id: usize, representatives: &HashMap<usize, InputSequence>, hit_clusters_ids: &HashMap<usize, u64>, hit_clusters_hit_positions: &HashMap<usize, Vec<usize>>, args_k: i64) {
+    let best_cluster_id = -1;
+    let mut top_matches: Vec<(&usize, &Vec<usize>)> = hit_clusters_hit_positions.iter().collect();
+    top_matches.sort_by_key(|x| (x.1.len(), x.1.iter().sum::<usize>(), representatives.get(x.0).unwrap().acc));
+    top_matches.reverse();
+
+    let rep_sequence = representatives.get(&read_cl_id).unwrap();
+    let seq = rep_sequence.sequence;
+    let r_qual = rep_sequence.quality;
+
+    let top_hits = top_matches.get(0).unwrap().1.len();
+    let alignment_ratio = 0.0;
+
+    for tm in top_matches {
+        let cl_id = tm.0;
+        let nm_hits = tm.1.len();
+
+        if nm_hits < top_hits {
+            break;
+        }
+
+        let c_sequence = representatives.get(cl_id).unwrap();
+
+        let c_seq = c_sequence.sequence;
+        let c_qual = c_sequence.quality;
+        
+        let poisson_mean = sum_phred_char_to_p(r_qual);
+        let poisson_mean2 = sum_phred_char_to_p(c_qual);
+
+        let error_rate_sum = poisson_mean / seq.len() as f64 + poisson_mean2 / c_seq.len() as f64;
+
+        let mut gap_opening_penalty = 0;
+        if error_rate_sum <= 0.01 {
+            gap_opening_penalty = 5;
+        } else if error_rate_sum <= 0.04 {
+            gap_opening_penalty = 4;
+        } else if error_rate_sum <= 0.1 {
+            gap_opening_penalty = 3;
+        } else {
+            gap_opening_penalty = 2;
+        }
+
+        let match_id_tailored = (1.0 - (error_rate_sum) * args_k as f64) as i64;
+        
+        let (s1, s2, (s1_alignment, s2_alignment, alignment_ratio)) = parasail_block_alignment(seq, c_seq, args_k, match_id_tailored, gap_opening_penalty);
+      
+
+    }
+}
+
+fn parasail_block_alignment(s1: &[u8], s2: &[u8], k: u64, match_id: i64, match_score: i64, mismatch_penalty: i64, opening_penalty: i64, gap_ext: i64) {
+
+    // def parasail_block_alignment(s1, s2, k, match_id, match_score = 2, mismatch_penalty = -2, opening_penalty = 5, gap_ext = 1):
+
+    let user_matrix = Matrix::create("ACGT", match_score, mismatch_penalty);
+    let result = parasailors::
 
 }
 
@@ -283,6 +344,9 @@ fn get_all_hits(minimizers: &Vec<(&[u8], usize)>, minimizer_database: &HashMap<&
 fn phred_char_to_p(c: u8) -> f64 {
     // phred_char_to_p = {chr(i) : min( 10**( - (ord(chr(i)) - 33)/10.0 ), 0.79433)  for i in range(128)} # PHRED encoded quality character to prob of error. Need this locally if multiprocessing
     return 10f64.powf(-(c as f64 - 33.0)/ 10.0).min(0.79433)
+}
+fn sum_phred_char_to_p(qual_str: &[u8]) -> f64 {
+    return qual_str.iter().map(|x| phred_char_to_p(*x)).sum();
 }
 fn get_min_quality(qual: &[u8]) -> (u8, f64) {
   
