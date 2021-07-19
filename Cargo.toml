@@ -1,0 +1,17 @@
+[package]
+name = "isonclust-rs"
+version = "0.0.1"
+authors = ["Andrew S <andrews3596@gmail.com>"]
+license = "GNU"
+documentation = "https://github.com/andrewprivate/isONclust-rust"
+repository = "https://github.com/andrewprivate/isONclust-rust"
+readme = "README.md"
+keywords = ["bioinformatics", "sequence", "cluster"]
+description = "Rust version of isONclust"
+
+[dependencies]
+parasailors = { path = "../parasailors" } 
+needletail = "0.4.1"
+serde_json = "1.0"
+ndarray = "0.15.3"
+itertools = "0.10.1"
