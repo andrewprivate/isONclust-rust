@@ -4,6 +4,7 @@ extern crate needletail;
 extern crate serde_json;
 extern crate itertools;
 extern crate regex;
+extern crate ordered_float;
 use regex::Regex;
 use std::path::Path;
 use std::fs;
@@ -23,20 +24,92 @@ pub struct InputSequence<'a> {
     error_rate: f64
 }
 
+pub fn process_fastq(reads: Vec<(String, String, String)>, k: usize) {
+    let mut probs = HashMap::new();
+    for i in 33u8..128 {
+        probs.insert(i, 10f64.powf(-1f64 * ((i as f64 - 33.0) / 10.0)));
+        // println!("{}\t{}", i as char, 10f64.powf(-1f64 * ((i as f64 - 33.0) / 10.0)));
+    }
+
+    let mut sorted_data = Vec::new();
+    for (i, (acc, sequence, qual)) in reads.iter().enumerate() {
+        if sequence.len() < 2 * k {
+            continue
+        }
+        // println!("{}", acc);
+        let score = calculate_score(&qual, k, &probs);
+        // println!("Score: {}", score);
+        let mut new = InputSequence{ read_cl_id: i, batch_index: 0, sequence: sequence.as_bytes(), quality: qual.as_bytes(), acc: acc.as_bytes(), score, error_rate: 0f64};
+        sorted_data.push(new);
+    }
+    sorted_data.sort_by(|s1, s2| s2.score.partial_cmp(&s1.score).unwrap());
+    // for r in sorted_data.iter() {
+        // println!("@{}_{}\n{}\n+\n{}", String::from_utf8_lossy(r.acc), r.score, String::from_utf8_lossy(r.sequence), String::from_utf8_lossy(r.quality));
+        // println!("@{}_{}", String::from_utf8_lossy(r.acc), r.score);
+    // }
+    cluster(&sorted_data);
+}
+
+fn calculate_score(qual: &str, k: usize, probs: &HashMap<u8, f64>) -> f64 {
+    // println!("Len: {}", qual.len());
+    let exp_errors_in_kmers = estimate_erroneous_kmers(qual, k, probs);
+    // println!("Exp errors: {}", exp_errors_in_kmers);
+    let p_no_errors = 1f64-(exp_errors_in_kmers)/(qual.len() - k + 1) as f64;
+    // println!("P no errors: {}", p_no_errors);
+    let score = p_no_errors * (qual.len() - k + 1) as f64;
+
+    return score;
+}
+
+fn estimate_erroneous_kmers(qual: &str, k: usize, probs: &HashMap<u8, f64>) -> f64 {
+    let mut prob_vec = Vec::new();
+    for c in qual.chars() {
+        prob_vec.push(1. - *probs.get(&(c as u8)).unwrap());
+    }
+    // println!("{:?}", prob_vec);
+    let mut window: VecDeque<f64> = prob_vec[0..k].iter().cloned().collect();
+    // println!("{:?}", window);
+    let mut prob_no_error = 1f64;
+    for p in &window {
+        prob_no_error *= *p;
+    }
+    // println!("{}", prob_no_error);
+    let mut sum_of_e = prob_no_error;
+    for p in prob_vec[k..].iter() {
+        let p_to_leave = window.pop_front().unwrap();
+        prob_no_error *= p/p_to_leave;
+        sum_of_e += prob_no_error;
+        window.push_back(*p);
+    }
+    return (qual.len() - k + 1) as f64 - sum_of_e
+}
+
+pub fn build_input_sequence<'a> ( read_cl_id: usize, batch_index: usize, sequence: &'a [u8], quality: &'a [u8], acc: &'a [u8],  score: f64, error_rate: f64) -> InputSequence<'a> {
+    InputSequence {
+        read_cl_id,
+        batch_index,
+        sequence,
+        quality,
+        acc, // accuracy?
+        score, // Score?
+        error_rate
+    }
+}
 
 pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, std::vec::Vec<&InputSequence<'a>>>, HashMap<usize, InputSequence<'a>>, HashMap<Vec<u8>, std::vec::Vec<usize>>) {
     // Arguments. Need to move out.
-    let args_k = 1;
-    let args_w = 1;
-    let args_min_shared = 1;
-    let args_min_shared = 1;
-    let args_min_fraction = 1;
-    let args_aligned_threshold = 1.0;
-    let args_min_prob_no_hits = 1.0;
-    let args_mapped_threshold = 1.0;
+    let args_k = 15;
+    let args_w = 50;
+    // let args_min_shared = 5;
+    let args_min_shared = 5;
+    let args_min_fraction = 0.8;
+    let args_aligned_threshold = 0.4;
+    let args_min_prob_no_hits = 0.1;
+    let args_mapped_threshold = 0.7;
+    let mut aln_calls = 0;
 
     // Will cache this later 
-    let data = fs::read_to_string(Path::new("./p_minimizers_shared.json")).expect("Failed to read p_minimizers_shared file");
+    let data = fs::read_to_string(Path::new("C:\\CLionProjects\\isONclust-rust\\src\\p_minimizers_shared.json")).expect("Failed to read p_minimizers_shared file");
     let parsed: Vec<Vec<serde_json::Value>> = serde_json::from_str(&data).expect("Failed to parse p_minimizers_shared file");
 
    
@@ -55,7 +128,6 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
             p_emp_probs.insert(e2.to_string() + "|" + &e1.to_string(), p);
         }
     }
-
     //  read_array = [ (i, 0, acc, seq, qual, float(acc.split("_")[-1])) for i, (acc, (seq, qual)) in enumerate(help_functions.readfq(open(sorted_reads_fastq_file, 'r')))]
     
 
@@ -82,7 +154,7 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
         
         let (seq_hpol_comp, all_read_hpol_lengths) = get_seq_hpol_comp(sequence.sequence);
         if seq_hpol_comp.len() < args_k as usize {
-            print!( "skipping read of length: {} homopolymer compressed: {} sequence: {}", sequence.sequence.len(), seq_hpol_comp.len(), String::from_utf8(sequence.sequence.to_vec()).unwrap());
+            eprintln!( "skipping read of length: {} homopolymer compressed: {} sequence: {}", sequence.sequence.len(), seq_hpol_comp.len(), String::from_utf8(sequence.sequence.to_vec()).unwrap());
             continue;
         }
 
@@ -97,19 +169,21 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
             let mut start = 0;
 
             for h_len in all_read_hpol_lengths {
-                let q_max = get_min_quality(&sequence.quality[start..(start + h_len)]);
-                quality_comp.push(q_max);
-                start += h_len;
+                if h_len > 0 {
+                    let q_max = get_min_quality(&sequence.quality[start..(start + h_len)]);
+                    quality_comp.push(q_max);
+                    start += h_len;
+                }
             }
             assert_eq!(quality_comp.len(), seq_hpol_comp.len(), "Compressed quality length is not consistant with the compressed sequence length.");
 
             let quality_sum: f64 = quality_comp.iter().map(|v| v.1).sum();
             let h_pol_compr_error_rate = quality_sum/quality_comp.len() as f64;
-
+            // println!("{}", h_pol_compr_error_rate);
         
             let new = InputSequence { read_cl_id: sequence.read_cl_id, acc: sequence.acc, batch_index: sequence.batch_index, sequence: sequence.sequence, quality: sequence.quality, score: sequence.score, error_rate: h_pol_compr_error_rate };
             representatives.insert(sequence.read_cl_id, new);
-            
+
         //}
         // 3. Find all the representatives with shared minimizers (this is the time consuming function for noisy and large datasets)
 
@@ -118,7 +192,7 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
 
 
         // # 4. Finds the best of the hits using mapping approach
-        let (best_cluster_id_m, nr_shared_kmers_m, mapped_ratio) = get_best_cluster(sequence.read_cl_id, seq_hpol_comp.len(), &hit_clusters_ids, &hit_clusters_hit_positions, &minimizers, minimizers.len(), &hit_clusters_hit_index, &representatives, &p_emp_probs, args_min_shared, args_min_fraction, args_min_prob_no_hits, args_mapped_threshold);
+        let (best_cluster_id_m, nr_shared_kmers_m, _mapped_ratio) = get_best_cluster(sequence.read_cl_id, seq_hpol_comp.len(), &hit_clusters_ids, &hit_clusters_hit_positions, &minimizers, minimizers.len(), &hit_clusters_hit_index, &representatives, &p_emp_probs, args_min_shared, args_min_fraction, args_min_prob_no_hits, args_mapped_threshold);
 
 
         // 5. If step 4 is unsuccessfull we try to align the read to the representative(s) with the most shared minimizers.
@@ -127,8 +201,9 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
         let mut best_cluster_id_a = -1;
 
         if best_cluster_id_m < 0 && nr_shared_kmers_m >= args_min_shared {
-            // aln_called += 1
-            let (best_cluster_id_a, nr_shared_kmers_a, error_rate_sum, s1_alignment, s2_alignment, alignment_ratio) = get_best_cluster_block_align(sequence.read_cl_id, &representatives, &hit_clusters_ids, &hit_clusters_hit_positions, args_k, args_aligned_threshold);
+            aln_calls += 1;
+            let (best_cluster_id_ta, _nr_shared_kmers_a, _error_rate_sum, _s1_alignment, _s2_alignment, _alignment_ratio) = get_best_cluster_block_align(sequence.read_cl_id, &representatives, &hit_clusters_ids, &hit_clusters_hit_positions, args_k, args_aligned_threshold);
+            best_cluster_id_a = best_cluster_id_ta;
         }
         
         // 6. Adds current read to representative, or makes it a new representative of a new cluster.
@@ -142,7 +217,12 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
 
             for (k, pos) in minimizers {
                 if minimizer_database.contains_key(k) {
-                    minimizer_database.get_mut(k).unwrap().push(sequence.read_cl_id);
+                    let md_vec = minimizer_database.get_mut(k).unwrap();
+                    if md_vec.contains(&sequence.read_cl_id) {
+
+                    } else {
+                        md_vec.push(sequence.read_cl_id);
+                    }
                 } else {
                     let mut v = Vec::new();
                     v.push(sequence.read_cl_id);
@@ -151,19 +231,32 @@ pub fn cluster<'a>(sorted_data: &'a Vec<InputSequence<'a>>) -> (HashMap<usize, s
             }
         }
     }
-    for read_cl_id in cluster_to_new_cluster_id.values() {
-        let new_cl_id = cluster_to_new_cluster_id.get(read_cl_id).unwrap();
-        let all_reads = clusters.get(read_cl_id).unwrap().to_owned();
-        let cl = clusters.get_mut(new_cl_id).unwrap();
+
+    for (old_cl_id,new_cl_id) in cluster_to_new_cluster_id {
+        // let new_cl_id = cluster_to_new_cluster_id.get(read_cl_id).unwrap();
+        let all_reads = clusters.get(&old_cl_id).unwrap().to_owned();
+        let cl = clusters.get_mut(&new_cl_id).unwrap();
         for read_acc in all_reads {
             cl.push(read_acc);
         }
-        clusters.remove(read_cl_id);
-        representatives.remove(read_cl_id);
+        clusters.remove(&old_cl_id);
+        representatives.remove(&old_cl_id);
     }
-   
+
+    let mut total = 0;
+    let mut g1 = 0;
+    for (cl_id, read_vec) in &clusters {
+        total += 1;
+        if read_vec.len() > 1 {
+            g1 += 1;
+        }
+    }
  
     // Output:
+    // println!("{:?}", representatives);
+    println!("Generated {} clusters", total);
+    println!("{} clusters contain more than one read", g1);
+    println!("{} alignment calls", aln_calls);
     return (clusters, representatives, minimizer_database);
 }
 
@@ -256,7 +349,6 @@ fn parasail_block_alignment(s1: &[u8], s2: &[u8], k: i64, match_id: i64, opening
 
     let user_matrix = Matrix::create("ACGT", match_score, mismatch_penalty);
     let result = parasailors::semi_global_alignment_trace_scan_sat_cigar(s1, s2, opening_penalty, gap_ext, &user_matrix);
-
     let (s1_alignment, s2_alignment) = cigar_to_seq(&result.cigar_trace, s1, s2);
 
     let match_vector: Vec<i64> = s1_alignment.iter().zip(s2_alignment.iter()).map(|(n1,n2)| if n1 == n2 { return 1; } else { return 0; }).collect();
@@ -338,7 +430,7 @@ fn cigar_to_seq(cigar: &String, query: &[u8], refs: &[u8]) -> (Vec<u8>, Vec<u8>)
     return (q_aln, r_aln);
 }
 
-fn get_best_cluster(read_cl_id: usize, compressed_seq_len: usize, hit_clusters_ids: &HashMap<usize, u64>, hit_clusters_hit_positions: &HashMap<usize, Vec<usize>>, minimizers: &Vec<(&[u8], usize)>, nummber_of_minimizers: usize, hit_clusters_hit_index: &HashMap<usize, Vec<usize>>, representatives: &HashMap<usize, InputSequence>, p_emp_probs: &HashMap<String, f64>, args_min_shared: usize, args_min_fraction: usize, args_min_prob_no_hits: f64, args_mapped_threshold: f64) 
+fn get_best_cluster(read_cl_id: usize, compressed_seq_len: usize, hit_clusters_ids: &HashMap<usize, u64>, hit_clusters_hit_positions: &HashMap<usize, Vec<usize>>, minimizers: &Vec<(&[u8], usize)>, nummber_of_minimizers: usize, hit_clusters_hit_index: &HashMap<usize, Vec<usize>>, representatives: &HashMap<usize, InputSequence>, p_emp_probs: &HashMap<String, f64>, args_min_shared: usize, args_min_fraction: f64, args_min_prob_no_hits: f64, args_mapped_threshold: f64)
     -> (i64, usize, f64) {
 
     /*
@@ -348,7 +440,7 @@ fn get_best_cluster(read_cl_id: usize, compressed_seq_len: usize, hit_clusters_i
         Return: An integer >= 0 denoting the cluster ID that this read was assigned to. In not assigend to any previous cluster, return None. 
                 [Also returing mapped ratio and nr shared minimizers to best read for logging purposes.]
     */
-    
+
     let nr_shared_kmers = 0;
     let mut mapped_ratio = 0.0;
 
@@ -360,20 +452,24 @@ fn get_best_cluster(read_cl_id: usize, compressed_seq_len: usize, hit_clusters_i
     top_matches.sort_by_key(|x| (x.1.len(), x.1.iter().sum::<usize>(), representatives.get(x.0).unwrap().acc));
     top_matches.reverse();
 
+    // println!("{:?}", top_matches);
     let top_hits = top_matches.get(0).unwrap().1.len();
     let nr_shared_kmers = top_hits;
 
+    // println!("{}\t{}", top_hits, nr_shared_kmers);
     if top_hits < args_min_shared {
         // pass
     } else {
         for tm in top_matches {
             let cl_id = tm.0;
             let nm_hits = tm.1.len();
-            if nm_hits < args_min_fraction * top_hits || nm_hits < args_min_shared {
+            // println!("{} <? {}", nm_hits, args_min_fraction * (top_hits as f64));
+            if (nm_hits as f64) < args_min_fraction * (top_hits as f64) || nm_hits < args_min_shared {
                 break;
             }
 
             let minimizer_hit_positions = hit_clusters_hit_positions.get(cl_id).unwrap();
+            // println!("{:?}", minimizer_hit_positions);
             let minimizer_hit_indices = hit_clusters_hit_index.get(cl_id).unwrap();
             assert_eq!(minimizer_hit_indices.len(), minimizer_hit_positions.len(), "Unequal lengths!");
 
@@ -387,23 +483,31 @@ fn get_best_cluster(read_cl_id: usize, compressed_seq_len: usize, hit_clusters_i
             let mut prob_all_errors_since_last_hit = Vec::new();
             prob_all_errors_since_last_hit.push(minimizer_error_probabilities[..minimizer_hit_indices[0]].iter().fold(1.0, |a, b| a*b));
             for (hit_idx1, hit_idx2) in minimizer_hit_indices[..minimizer_hit_indices.len() - 1].iter().zip(minimizer_hit_indices[1..].iter()) {
-                prob_all_errors_since_last_hit.push(minimizer_error_probabilities[hit_idx1+1..*hit_idx2].iter().fold(1.0, |a, b| a*b));
+                if *hit_idx1 == *hit_idx2 {
+                    prob_all_errors_since_last_hit.push(1.);
+                } else {
+                    prob_all_errors_since_last_hit.push(minimizer_error_probabilities[*hit_idx1 + 1..*hit_idx2].iter().fold(1.0, |a, b| a*b));
+                }
             }
             prob_all_errors_since_last_hit.push(minimizer_error_probabilities[minimizer_hit_indices[minimizer_hit_indices.len() - 1]+1..].iter().fold(1.0, |a, b| a*b));
 
             assert_eq!(prob_all_errors_since_last_hit.len(), minimizer_hit_positions.len() + 1, "Invalid lengths!");
 
             for i in 0..minimizer_hit_indices.len() {
+                // println!("{} <? {}: {}", prob_all_errors_since_last_hit[i], args_min_prob_no_hits, prob_all_errors_since_last_hit[i] < args_min_prob_no_hits);
+
                 if prob_all_errors_since_last_hit[i] < args_min_prob_no_hits {
                     // pass
                 } else {
                     if i == 0 {
                         total_mapped += minimizer_hit_positions[i];
                     } else {
+                        // println!("{}\t{}", minimizer_hit_positions[i], minimizer_hit_positions[i-1]);
                         total_mapped += minimizer_hit_positions[i] - minimizer_hit_positions[i - 1];
                     }
                 }
             }
+            // println!("{}", total_mapped);
             if prob_all_errors_since_last_hit[prob_all_errors_since_last_hit.len() - 1] < args_min_prob_no_hits {
                 // pass
             } else {
@@ -453,12 +557,15 @@ fn get_all_hits(minimizers: &Vec<(&[u8], usize)>, minimizer_database: &HashMap<V
     let mut hit_clusters_hit_index = HashMap::new();
     let mut hit_clusters_hit_positions = HashMap::new();
 
+    // println!("{:?}", minimizers);
     for (i, (m, pos)) in minimizers.iter().enumerate() {
         if minimizer_database.contains_key(*m) {
             for cl_id in minimizer_database.get(*m).unwrap() {
+                // println!("m: {:?}\tcl_id: {}", *m, cl_id);
                 hit_clusters_ids.insert(*cl_id, hit_clusters_ids.get(&cl_id).unwrap_or(&0) + 1);
                 hit_clusters_hit_index.entry(*cl_id).or_insert(Vec::new()).push(i);
                 hit_clusters_hit_positions.entry(*cl_id).or_insert(Vec::new()).push(*pos);
+                // println!("{:?}", pos)
             }
         }
     }
@@ -510,14 +617,17 @@ fn get_kmer_minimizers(seq: &Vec<u8>, k_size: i64, w_size: i64) -> Vec<(&[u8], u
     let mut window_kmers = VecDeque::new();
 
     // Make the kmers (sliding window)
-    for i in 0..(w+1) {
-        window_kmers.push_back(&seq[(i as usize)..((i+k_size) as usize)]);
+    for i in 0..(w + 1) as usize {
+        if i + (k_size as usize) < seq.len() {
+            window_kmers.push_back(&seq[(i as usize)..((i + k_size as usize) as usize)]);
+        }
     }
 
     let mut minimizers = Vec::new();
     let mut curr_min = get_min_and_index(&window_kmers);
     minimizers.push(curr_min);
 
+    // println!("{}", String::from_utf8_lossy(curr_min.0));
     for i in (w as usize+1)..(seq.len() - k_size as usize + 1) {
         let new_kmer = &seq[i..(i + k_size as usize)];
         let discarded = window_kmers.pop_front().unwrap();
@@ -525,12 +635,16 @@ fn get_kmer_minimizers(seq: &Vec<u8>, k_size: i64, w_size: i64) -> Vec<(&[u8], u
 
         if curr_min.0 == discarded {
             curr_min = get_min_and_index(&window_kmers);
+            curr_min.1 += i - w as usize;
             minimizers.push(curr_min);
+            // println!("Pushing {:?}", curr_min);
         } else if new_kmer < curr_min.0 {
             curr_min = (new_kmer, i);
             minimizers.push(curr_min);
+            // println!("Pushing {:?}", curr_min);
         }
     }
+    // println!("{:?}", minimizers);
     return minimizers;
 }
 
